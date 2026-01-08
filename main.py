@@ -1,19 +1,16 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import os
-import shutil
-import threading
-
+from openai import OpenAI
 from pypdf import PdfReader
 from docx import Document
-from openai import OpenAI
+import os
+import shutil
 
 load_dotenv()
 
 app = FastAPI()
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,9 +23,9 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# -------------------------------------------------
-# Hjelpefunksjoner (isolert)
-# -------------------------------------------------
+# ---------------------------
+# Hjelpefunksjoner
+# ---------------------------
 
 def extract_text_from_pdf(path: str) -> str:
     reader = PdfReader(path)
@@ -43,66 +40,81 @@ def extract_text_from_docx(path: str) -> str:
     doc = Document(path)
     return "\n".join(p.text for p in doc.paragraphs).strip()
 
-# -------------------------------------------------
-# Health check
-# -------------------------------------------------
+# ---------------------------
+# Health
+# ---------------------------
 
 @app.get("/")
 def root():
     return {"status": "API running"}
 
-# -------------------------------------------------
-# Chat – ALLTID uavhengig av filopplasting
-# -------------------------------------------------
+# ---------------------------
+# Chat med valgfritt vedlegg
+# ---------------------------
 
-@app.post("/ask")
-def ask_ai(data: dict):
+@app.post("/ask-with-file")
+async def ask_with_file(
+    question: str = Form(...),
+    role: str = Form(...),
+    file: UploadFile | None = File(None)
+):
+    context_text = ""
+
+    # Hvis fil er vedlagt
+    if file:
+        file_path = os.path.join(UPLOAD_DIR, file.filename)
+
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        ext = file.filename.lower().split(".")[-1]
+
+        try:
+            if ext == "pdf":
+                context_text = extract_text_from_pdf(file_path)
+            elif ext in ["docx", "doc"]:
+                context_text = extract_text_from_docx(file_path)
+            else:
+                raise HTTPException(status_code=400, detail="Unsupported file type")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="Failed to read file")
+
+    # Begrens kontekst (viktig!)
+    context_text = context_text[:4000]
+
     try:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    f"Du er en faglig assistent innen byggautomasjon.\n"
+                    f"Brukerrolle: {role}\n\n"
+                    f"Hvis dokumentkontekst er gitt, bruk den aktivt i svaret."
+                )
+            }
+        ]
+
+        if context_text:
+            messages.append({
+                "role": "system",
+                "content": f"Dokumentkontekst:\n{context_text}"
+            })
+
+        messages.append({
+            "role": "user",
+            "content": question
+        })
+
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": f"Brukerrolle: {data.get('role')}"},
-                {"role": "user", "content": data.get("question")}
-            ],
+            messages=messages,
             timeout=30
         )
-        return {"answer": response.choices[0].message.content}
 
-    except Exception as e:
-        print("OpenAI-feil:", e)
-        raise HTTPException(status_code=500, detail="AI backend error")
-
-# -------------------------------------------------
-# Upload – isolert og beskyttet
-# -------------------------------------------------
-
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    ext = file.filename.lower().split(".")[-1]
-
-    try:
-        if ext == "pdf":
-            text = extract_text_from_pdf(file_path)
-        elif ext in ["docx", "doc"]:
-            text = extract_text_from_docx(file_path)
-        else:
-            return {
-                "filename": file.filename,
-                "status": "unsupported_file_type"
-            }
-
-        # VIKTIG: aldri returner for mye
         return {
-            "filename": file.filename,
-            "characters": len(text),
-            "preview": text[:800]
+            "answer": response.choices[0].message.content,
+            "used_file": bool(file)
         }
 
     except Exception as e:
-        print("Fil-lesefeil:", e)
-        raise HTTPException(status_code=500, detail="File processing error")
+        raise HTTPException(status_code=500, detail="AI processing failed")
