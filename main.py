@@ -1,65 +1,36 @@
+# FORCE RAILWAY REDEPLOY
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 import os
 from openai import OpenAI
 
-# -------------------------
-# App-oppsett
-# -------------------------
 app = FastAPI(
     title="Prosjektbot API",
-    description="Backend for FDV- og prosjektassistent",
     version="1.0.0"
 )
 
-# -------------------------
-# OpenAI-klient
-# (API-nøkkel settes i Railway Variables)
-# -------------------------
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY")
-)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# -------------------------
-# Datamodeller
-# -------------------------
 class Question(BaseModel):
     question: str
     role: str
 
-# -------------------------
-# Root – helsesjekk
-# -------------------------
 @app.get("/")
 def root():
     return {"status": "API running"}
 
-# -------------------------
-# Chat-endepunkt
-# -------------------------
 @app.post("/ask")
 def ask_ai(data: Question):
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
-            {
-                "role": "system",
-                "content": f"Du er en faglig assistent. Brukerrolle: {data.role}"
-            },
-            {
-                "role": "user",
-                "content": data.question
-            }
+            {"role": "system", "content": f"Brukerrolle: {data.role}"},
+            {"role": "user", "content": data.question}
         ]
     )
+    return {"answer": response.choices[0].message.content}
 
-    return {
-        "answer": response.choices[0].message.content
-    }
-
-# -------------------------
-# FDV-dashboard / score
-# -------------------------
 @app.get("/fdv-dashboard")
 @app.get("/fdv-dashboard/")
 def fdv_dashboard():
@@ -73,4 +44,3 @@ def fdv_dashboard():
             "E – Teknisk dokumentasjon": {"percent": 75}
         }
     }
-
