@@ -22,14 +22,24 @@ def root():
 
 @app.post("/ask")
 def ask_ai(data: Question):
-    response = client.chat.completions.create(
+    completion = client.responses.create(
         model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": f"Brukerrolle: {data.role}"},
-            {"role": "user", "content": data.question}
+        input=[
+            {
+                "role": "system",
+                "content": f"Du er en faglig prosjektassistent. Brukerrolle: {data.role}"
+            },
+            {
+                "role": "user",
+                "content": data.question
+            }
         ]
     )
-    return {"answer": response.choices[0].message.content}
+
+    return {
+        "answer": completion.output_text
+    }
+
 
 @app.get("/fdv-dashboard")
 @app.get("/fdv-dashboard/")
