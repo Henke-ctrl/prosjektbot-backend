@@ -3,24 +3,19 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
-from openai import OpenAI
+import openai
+
+# -------------------------------------------------
+# OpenAI-oppsett (klassisk SDK)
+# -------------------------------------------------
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # -------------------------------------------------
 # App-oppsett
 # -------------------------------------------------
 app = FastAPI(
     title="Prosjektbot API",
-    description="Backend for KI-assistent innen byggautomasjon og FDV",
     version="1.0.0"
-)
-
-# -------------------------------------------------
-# OpenAI-klient
-# API-nøkkel settes i Railway → Variables
-# Key: OPENAI_API_KEY
-# -------------------------------------------------
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY")
 )
 
 # -------------------------------------------------
@@ -31,21 +26,21 @@ class Question(BaseModel):
     role: str
 
 # -------------------------------------------------
-# Root / helsesjekk
+# Root
 # -------------------------------------------------
 @app.get("/")
 def root():
     return {"status": "API running"}
 
 # -------------------------------------------------
-# Chat-endepunkt (KORREKT for OpenAI Responses API)
+# Chat-endepunkt (STABIL)
 # -------------------------------------------------
 @app.post("/ask")
 def ask_ai(data: Question):
     try:
-        response = client.responses.create(
-            model="gpt-4.1-mini",
-            input=[
+        completion = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
                 {
                     "role": "system",
                     "content": f"Du er en faglig KI-assistent for prosjektstøtte innen byggautomasjon. Brukerrolle: {data.role}"
@@ -54,30 +49,19 @@ def ask_ai(data: Question):
                     "role": "user",
                     "content": data.question
                 }
-            ]
+            ],
+            temperature=0.3
         )
 
-        # Robust uthenting av tekst fra responsen
-        answer = ""
-
-        if response.output:
-            for item in response.output:
-                if item.get("type") == "message":
-                    for content in item.get("content", []):
-                        if content.get("type") == "output_text":
-                            answer += content.get("text", "")
-
-        if not answer:
-            answer = "Ingen tekstlig respons fra modellen."
-
-        return {"answer": answer}
+        return {
+            "answer": completion.choices[0].message["content"]
+        }
 
     except Exception as e:
-        # Viktig: gir synlig feil i Swagger + Railway logs
         raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------------------------------
-# FDV-dashboard (status / score)
+# FDV-dashboard
 # -------------------------------------------------
 @app.get("/fdv-dashboard")
 @app.get("/fdv-dashboard/")
