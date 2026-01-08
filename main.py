@@ -11,6 +11,7 @@ load_dotenv()
 
 app = FastAPI()
 
+# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,11 +24,9 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ---------------------------
-# Hjelpefunksjoner
-# ---------------------------
+# ---------------- Utils ----------------
 
-def extract_text_from_pdf(path: str) -> str:
+def read_pdf(path: str) -> str:
     reader = PdfReader(path)
     text = ""
     for page in reader.pages:
@@ -36,85 +35,85 @@ def extract_text_from_pdf(path: str) -> str:
             text += t + "\n"
     return text.strip()
 
-def extract_text_from_docx(path: str) -> str:
+def read_docx(path: str) -> str:
     doc = Document(path)
     return "\n".join(p.text for p in doc.paragraphs).strip()
 
-# ---------------------------
-# Health
-# ---------------------------
+# ---------------- Health ----------------
 
 @app.get("/")
 def root():
     return {"status": "API running"}
 
-# ---------------------------
-# Chat med valgfritt vedlegg
-# ---------------------------
+# ---------------- Attachment Chat ----------------
 
-@app.post("/ask-with-file")
-async def ask_with_file(
+@app.post("/ask")
+async def ask_with_optional_file(
     question: str = Form(...),
     role: str = Form(...),
     file: UploadFile | None = File(None)
 ):
-    context_text = ""
+    if not question.strip():
+        raise HTTPException(status_code=400, detail="Empty question")
 
-    # Hvis fil er vedlagt
-    if file:
-        file_path = os.path.join(UPLOAD_DIR, file.filename)
+    context = ""
 
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+    # ---- Les fil hvis den finnes ----
+    if file and file.filename:
+        path = os.path.join(UPLOAD_DIR, file.filename)
+
+        with open(path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
 
         ext = file.filename.lower().split(".")[-1]
 
         try:
             if ext == "pdf":
-                context_text = extract_text_from_pdf(file_path)
+                context = read_pdf(path)
             elif ext in ["docx", "doc"]:
-                context_text = extract_text_from_docx(file_path)
+                context = read_docx(path)
             else:
                 raise HTTPException(status_code=400, detail="Unsupported file type")
         except Exception as e:
-            raise HTTPException(status_code=500, detail="Failed to read file")
+            print("Fil-lesefeil:", e)
+            raise HTTPException(status_code=500, detail="Failed to read attachment")
 
-    # Begrens kontekst (viktig!)
-    context_text = context_text[:4000]
+    # ---- Begrens kontekst ----
+    context = context[:3500]
 
-    try:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    f"Du er en faglig assistent innen byggautomasjon.\n"
-                    f"Brukerrolle: {role}\n\n"
-                    f"Hvis dokumentkontekst er gitt, bruk den aktivt i svaret."
-                )
-            }
-        ]
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Du er en faglig assistent innen byggautomasjon.\n"
+                f"Brukerrolle: {role}\n"
+                "Svar presist og profesjonelt."
+            )
+        }
+    ]
 
-        if context_text:
-            messages.append({
-                "role": "system",
-                "content": f"Dokumentkontekst:\n{context_text}"
-            })
-
+    if context:
         messages.append({
-            "role": "user",
-            "content": question
+            "role": "system",
+            "content": f"Dokumentvedlegg:\n{context}"
         })
 
+    messages.append({
+        "role": "user",
+        "content": question
+    })
+
+    try:
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=messages,
             timeout=30
         )
-
         return {
             "answer": response.choices[0].message.content,
-            "used_file": bool(file)
+            "used_attachment": bool(context)
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail="AI processing failed")
+        print("OpenAI-feil:", e)
+        raise HTTPException(status_code=500, detail="AI error")
