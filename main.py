@@ -1,16 +1,17 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
-from openai import OpenAI
 import shutil
+
+from pypdf import PdfReader
+from docx import Document
 
 load_dotenv()
 
 app = FastAPI()
 
-# CORS (viktig for frontend)
+# CORS – nødvendig for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,42 +19,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ---------------- Models ----------------
+# -------------------------------------------------
+# Hjelpefunksjoner for tekstekstraksjon
+# -------------------------------------------------
 
-class Question(BaseModel):
-    question: str
-    role: str
+def extract_text_from_pdf(path: str) -> str:
+    reader = PdfReader(path)
+    text = ""
+    for page in reader.pages:
+        if page.extract_text():
+            text += page.extract_text() + "\n"
+    return text.strip()
 
-# ---------------- Routes ----------------
+def extract_text_from_docx(path: str) -> str:
+    doc = Document(path)
+    return "\n".join([p.text for p in doc.paragraphs]).strip()
+
+# -------------------------------------------------
+# Routes
+# -------------------------------------------------
 
 @app.get("/")
 def root():
     return {"status": "API running"}
 
-@app.post("/ask")
-def ask_ai(data: Question):
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": f"Brukerrolle: {data.role}"},
-            {"role": "user", "content": data.question}
-        ]
-    )
-    return {"answer": response.choices[0].message.content}
-
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     file_path = os.path.join(UPLOAD_DIR, file.filename)
 
+    # Lagre fil
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
+    # Les tekst basert på filtype
+    ext = file.filename.lower().split(".")[-1]
+
+    if ext == "pdf":
+        text = extract_text_from_pdf(file_path)
+    elif ext in ["docx", "doc"]:
+        text = extract_text_from_docx(file_path)
+    else:
+        return {
+            "filename": file.filename,
+            "status": "unsupported_file_type"
+        }
+
+    # Returner kontrollert mengde tekst
     return {
         "filename": file.filename,
-        "status": "uploaded"
+        "characters": len(text),
+        "preview": text[:1000]  # kun første 1000 tegn
     }
