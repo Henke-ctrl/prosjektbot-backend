@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -7,15 +7,11 @@ from docx import Document
 import os
 import shutil
 
-# -------------------------------------------------
-# Init
-# -------------------------------------------------
-
 load_dotenv()
 
 app = FastAPI()
 
-# CORS – tillat frontend
+# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,9 +24,7 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# -------------------------------------------------
-# Hjelpefunksjoner – fil-lesing
-# -------------------------------------------------
+# ---------------- Utils ----------------
 
 def read_pdf(path: str) -> str:
     reader = PdfReader(path)
@@ -45,66 +39,72 @@ def read_docx(path: str) -> str:
     doc = Document(path)
     return "\n".join(p.text for p in doc.paragraphs).strip()
 
-# -------------------------------------------------
-# Health check
-# -------------------------------------------------
+# ---------------- Health ----------------
 
 @app.get("/")
 def root():
     return {"status": "API running"}
 
-# -------------------------------------------------
-# Chat med valgfritt vedlegg (HOVEDENDPOINT)
-# -------------------------------------------------
+# ---------------- UNIVERSAL CHAT ENDPOINT ----------------
 
 @app.post("/ask")
-async def ask(
-    question: str = Form(None),
-    role: str = Form(None),
-    file: UploadFile | None = File(None)
-):
-    # --- Valider input ---
+async def ask(request: Request):
+    """
+    Støtter:
+    - application/json (vanlig chat)
+    - multipart/form-data (chat + vedlegg)
+    """
+
+    content_type = request.headers.get("content-type", "")
+
+    question = None
+    role = "Ukjent"
+    file = None
+
+    # ---------- JSON ----------
+    if "application/json" in content_type:
+        data = await request.json()
+        question = data.get("question")
+        role = data.get("role", role)
+
+    # ---------- FORM + FILE ----------
+    elif "multipart/form-data" in content_type:
+        form = await request.form()
+        question = form.get("question")
+        role = form.get("role", role)
+        file = form.get("file")
+
+    else:
+        raise HTTPException(status_code=415, detail="Unsupported content type")
+
     if not question or not question.strip():
         raise HTTPException(status_code=400, detail="Question is required")
 
-    if not role:
-        role = "Ukjent"
-
+    # ---------- Attachment context ----------
     context = ""
 
-    # --- Les vedlegg hvis det finnes ---
-    if file is not None and file.filename:
+    if file and hasattr(file, "filename") and file.filename:
         file_path = os.path.join(UPLOAD_DIR, file.filename)
 
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+        ext = file.filename.lower().split(".")[-1]
+
         try:
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-
-            ext = file.filename.lower().split(".")[-1]
-
             if ext == "pdf":
                 context = read_pdf(file_path)
             elif ext in ["docx", "doc"]:
                 context = read_docx(file_path)
             else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Unsupported file type"
-                )
-
-        except HTTPException:
-            raise
+                raise HTTPException(status_code=400, detail="Unsupported file type")
         except Exception as e:
-            print("Feil ved fil-lesing:", e)
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to process attachment"
-            )
+            print("Fil-lesefeil:", e)
+            raise HTTPException(status_code=500, detail="Failed to read attachment")
 
-    # --- Begrens kontekst (VIKTIG) ---
     context = context[:3500]
 
-    # --- Bygg meldinger ---
+    # ---------- AI messages ----------
     messages = [
         {
             "role": "system",
@@ -128,7 +128,7 @@ async def ask(
         "content": question
     })
 
-    # --- Kall OpenAI ---
+    # ---------- OpenAI ----------
     try:
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -143,7 +143,4 @@ async def ask(
 
     except Exception as e:
         print("OpenAI-feil:", e)
-        raise HTTPException(
-            status_code=500,
-            detail="AI backend error"
-        )
+        raise HTTPException(status_code=500, detail="AI backend error")
