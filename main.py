@@ -4,6 +4,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
 import openai
+from fastapi.middleware.cors import CORSMiddleware
+
 
 # -------------------------------------------------
 # OpenAI-oppsett (klassisk SDK)
@@ -17,6 +19,17 @@ app = FastAPI(
     title="Prosjektbot API",
     version="1.0.0"
 )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://prosjektbot.no",
+        "https://www.prosjektbot.no"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # -------------------------------------------------
 # Datamodeller
