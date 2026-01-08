@@ -1,91 +1,59 @@
-# FORCE RAILWAY REDEPLOY
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import os
-import openai
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import os
+from openai import OpenAI
+import shutil
 
+load_dotenv()
 
-# -------------------------------------------------
-# OpenAI-oppsett (klassisk SDK)
-# -------------------------------------------------
-openai.api_key = os.getenv("OPENAI_API_KEY")
+app = FastAPI()
 
-# -------------------------------------------------
-# App-oppsett
-# -------------------------------------------------
-app = FastAPI(
-    title="Prosjektbot API",
-    version="1.0.0"
-)
+# CORS (viktig for frontend)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://prosjektbot.no",
-        "https://www.prosjektbot.no"
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# -------------------------------------------------
-# Datamodeller
-# -------------------------------------------------
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# ---------------- Models ----------------
+
 class Question(BaseModel):
     question: str
     role: str
 
-# -------------------------------------------------
-# Root
-# -------------------------------------------------
+# ---------------- Routes ----------------
+
 @app.get("/")
 def root():
     return {"status": "API running"}
 
-# -------------------------------------------------
-# Chat-endepunkt (STABIL)
-# -------------------------------------------------
 @app.post("/ask")
 def ask_ai(data: Question):
-    try:
-        completion = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"Du er en faglig KI-assistent for prosjektstøtte innen byggautomasjon. Brukerrolle: {data.role}"
-                },
-                {
-                    "role": "user",
-                    "content": data.question
-                }
-            ],
-            temperature=0.3
-        )
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": f"Brukerrolle: {data.role}"},
+            {"role": "user", "content": data.question}
+        ]
+    )
+    return {"answer": response.choices[0].message.content}
 
-        return {
-            "answer": completion.choices[0].message["content"]
-        }
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    file_path = os.path.join(UPLOAD_DIR, file.filename)
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
-# -------------------------------------------------
-# FDV-dashboard
-# -------------------------------------------------
-@app.get("/fdv-dashboard")
-@app.get("/fdv-dashboard/")
-def fdv_dashboard():
     return {
-        "total_score": 80,
-        "breakdown": {
-            "A – Orientering": {"percent": 100},
-            "B – Drift": {"percent": 100},
-            "C – Tilsyn og vedlikehold": {"percent": 50},
-            "D – Dokumentasjon": {"percent": 75},
-            "E – Teknisk dokumentasjon": {"percent": 75}
-        }
+        "filename": file.filename,
+        "status": "uploaded"
     }
