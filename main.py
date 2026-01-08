@@ -61,6 +61,7 @@ def ask_ai(data: Question):
 # FDV-dashboard / score
 # -------------------------
 @app.get("/fdv-dashboard")
+@app.get("/fdv-dashboard/")
 def fdv_dashboard():
     return {
         "total_score": 80,
@@ -72,3 +73,4 @@ def fdv_dashboard():
             "E – Teknisk dokumentasjon": {"percent": 75}
         }
     }
+
