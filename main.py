@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pypdf import PdfReader
 from docx import Document
+from openpyxl import load_workbook
 import os
 import shutil
 
@@ -11,7 +12,6 @@ load_dotenv()
 
 app = FastAPI()
 
-# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,95 +24,94 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ---------------- Utils ----------------
+# -------------------------------------------------
+# Fil-lesing
+# -------------------------------------------------
 
 def read_pdf(path: str) -> str:
     reader = PdfReader(path)
-    text = ""
-    for page in reader.pages:
-        t = page.extract_text()
-        if t:
-            text += t + "\n"
-    return text.strip()
+    return "\n".join(
+        page.extract_text() or "" for page in reader.pages
+    ).strip()
 
 def read_docx(path: str) -> str:
     doc = Document(path)
     return "\n".join(p.text for p in doc.paragraphs).strip()
 
-# ---------------- Health ----------------
+def read_excel(path: str) -> str:
+    wb = load_workbook(path, data_only=True)
+    sheet = wb.active
+
+    rows = []
+    for i, row in enumerate(sheet.iter_rows(values_only=True)):
+        if i > 50:  # begrens for ytelse
+            break
+        rows.append(" | ".join(str(cell) if cell is not None else "" for cell in row))
+
+    return "\n".join(rows).strip()
+
+# -------------------------------------------------
+# Health
+# -------------------------------------------------
 
 @app.get("/")
 def root():
     return {"status": "API running"}
 
-# ---------------- UNIVERSAL CHAT ENDPOINT ----------------
+# -------------------------------------------------
+# Chat med valgfritt vedlegg (PDF / DOCX / XLSX)
+# -------------------------------------------------
 
 @app.post("/ask")
 async def ask(request: Request):
-    """
-    Støtter:
-    - application/json (vanlig chat)
-    - multipart/form-data (chat + vedlegg)
-    """
-
     content_type = request.headers.get("content-type", "")
-
     question = None
     role = "Ukjent"
     file = None
 
-    # ---------- JSON ----------
+    # JSON
     if "application/json" in content_type:
         data = await request.json()
         question = data.get("question")
         role = data.get("role", role)
 
-    # ---------- FORM + FILE ----------
+    # FormData (med fil)
     elif "multipart/form-data" in content_type:
         form = await request.form()
         question = form.get("question")
         role = form.get("role", role)
         file = form.get("file")
 
-    else:
-        raise HTTPException(status_code=415, detail="Unsupported content type")
-
     if not question or not question.strip():
         raise HTTPException(status_code=400, detail="Question is required")
 
-    # ---------- Attachment context ----------
     context = ""
 
-    if file and hasattr(file, "filename") and file.filename:
-        file_path = os.path.join(UPLOAD_DIR, file.filename)
-
-        with open(file_path, "wb") as f:
+    if file and file.filename:
+        path = os.path.join(UPLOAD_DIR, file.filename)
+        with open(path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
         ext = file.filename.lower().split(".")[-1]
 
-        try:
-            if ext == "pdf":
-                context = read_pdf(file_path)
-            elif ext in ["docx", "doc"]:
-                context = read_docx(file_path)
-            else:
-                raise HTTPException(status_code=400, detail="Unsupported file type")
-        except Exception as e:
-            print("Fil-lesefeil:", e)
-            raise HTTPException(status_code=500, detail="Failed to read attachment")
+        if ext == "pdf":
+            context = read_pdf(path)
+        elif ext in ["docx", "doc"]:
+            context = read_docx(path)
+        elif ext in ["xlsx", "xls"]:
+            context = read_excel(path)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type")
 
-    context = context[:3500]
+    context = context[:3500]  # viktig grense
 
-    # ---------- AI messages ----------
     messages = [
         {
             "role": "system",
             "content": (
-                "Du er en faglig KI-assistent for prosjektstøtte "
-                "innen byggautomasjon.\n"
+                "Du er en faglig KI-assistent for prosjektstøtte innen byggautomasjon.\n"
                 f"Brukerrolle: {role}\n"
-                "Svar presist, strukturert og profesjonelt."
+                "Svar presist og faglig korrekt."
             )
         }
     ]
@@ -120,7 +119,7 @@ async def ask(request: Request):
     if context:
         messages.append({
             "role": "system",
-            "content": f"Dokumentvedlegg:\n{context}"
+            "content": f"Dokument-/Excel-innhold:\n{context}"
         })
 
     messages.append({
@@ -128,19 +127,13 @@ async def ask(request: Request):
         "content": question
     })
 
-    # ---------- OpenAI ----------
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=messages,
-            timeout=30
-        )
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=messages,
+        timeout=30
+    )
 
-        return {
-            "answer": response.choices[0].message.content,
-            "used_attachment": bool(context)
-        }
-
-    except Exception as e:
-        print("OpenAI-feil:", e)
-        raise HTTPException(status_code=500, detail="AI backend error")
+    return {
+        "answer": response.choices[0].message.content,
+        "used_attachment": bool(context)
+    }
