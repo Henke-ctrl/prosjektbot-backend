@@ -7,11 +7,15 @@ from docx import Document
 import os
 import shutil
 
+# -------------------------------------------------
+# Init
+# -------------------------------------------------
+
 load_dotenv()
 
 app = FastAPI()
 
-# ---------------- CORS ----------------
+# CORS – tillat frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,7 +28,9 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ---------------- Utils ----------------
+# -------------------------------------------------
+# Hjelpefunksjoner – fil-lesing
+# -------------------------------------------------
 
 def read_pdf(path: str) -> str:
     reader = PdfReader(path)
@@ -39,55 +45,74 @@ def read_docx(path: str) -> str:
     doc = Document(path)
     return "\n".join(p.text for p in doc.paragraphs).strip()
 
-# ---------------- Health ----------------
+# -------------------------------------------------
+# Health check
+# -------------------------------------------------
 
 @app.get("/")
 def root():
     return {"status": "API running"}
 
-# ---------------- Attachment Chat ----------------
+# -------------------------------------------------
+# Chat med valgfritt vedlegg (HOVEDENDPOINT)
+# -------------------------------------------------
 
 @app.post("/ask")
-async def ask_with_optional_file(
-    question: str = Form(...),
-    role: str = Form(...),
+async def ask(
+    question: str = Form(None),
+    role: str = Form(None),
     file: UploadFile | None = File(None)
 ):
-    if not question.strip():
-        raise HTTPException(status_code=400, detail="Empty question")
+    # --- Valider input ---
+    if not question or not question.strip():
+        raise HTTPException(status_code=400, detail="Question is required")
+
+    if not role:
+        role = "Ukjent"
 
     context = ""
 
-    # ---- Les fil hvis den finnes ----
-    if file and file.filename:
-        path = os.path.join(UPLOAD_DIR, file.filename)
-
-        with open(path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-
-        ext = file.filename.lower().split(".")[-1]
+    # --- Les vedlegg hvis det finnes ---
+    if file is not None and file.filename:
+        file_path = os.path.join(UPLOAD_DIR, file.filename)
 
         try:
-            if ext == "pdf":
-                context = read_pdf(path)
-            elif ext in ["docx", "doc"]:
-                context = read_docx(path)
-            else:
-                raise HTTPException(status_code=400, detail="Unsupported file type")
-        except Exception as e:
-            print("Fil-lesefeil:", e)
-            raise HTTPException(status_code=500, detail="Failed to read attachment")
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
 
-    # ---- Begrens kontekst ----
+            ext = file.filename.lower().split(".")[-1]
+
+            if ext == "pdf":
+                context = read_pdf(file_path)
+            elif ext in ["docx", "doc"]:
+                context = read_docx(file_path)
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unsupported file type"
+                )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            print("Feil ved fil-lesing:", e)
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to process attachment"
+            )
+
+    # --- Begrens kontekst (VIKTIG) ---
     context = context[:3500]
 
+    # --- Bygg meldinger ---
     messages = [
         {
             "role": "system",
             "content": (
-                "Du er en faglig assistent innen byggautomasjon.\n"
+                "Du er en faglig KI-assistent for prosjektstøtte "
+                "innen byggautomasjon.\n"
                 f"Brukerrolle: {role}\n"
-                "Svar presist og profesjonelt."
+                "Svar presist, strukturert og profesjonelt."
             )
         }
     ]
@@ -103,12 +128,14 @@ async def ask_with_optional_file(
         "content": question
     })
 
+    # --- Kall OpenAI ---
     try:
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=messages,
             timeout=30
         )
+
         return {
             "answer": response.choices[0].message.content,
             "used_attachment": bool(context)
@@ -116,4 +143,7 @@ async def ask_with_optional_file(
 
     except Exception as e:
         print("OpenAI-feil:", e)
-        raise HTTPException(status_code=500, detail="AI error")
+        raise HTTPException(
+            status_code=500,
+            detail="AI backend error"
+        )
