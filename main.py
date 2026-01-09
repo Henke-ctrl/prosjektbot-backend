@@ -95,6 +95,31 @@ def index_all_datasheets(base_dir: str, vendor: str):
         pdf_path = os.path.join(base_dir, filename)
         index_datasheet(pdf_path, vendor)
 
+def search_datasheets(query: str, vendor_dir: str, max_hits: int = 5) -> list[str]:
+    """
+    Enkel RAG-søk: finner relevante tekstbiter i indekserte datablad
+    """
+    hits = []
+
+    for filename in os.listdir(vendor_dir):
+        if not filename.endswith(".json"):
+            continue
+
+        path = os.path.join(vendor_dir, filename)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        for chunk in data["chunks"]:
+            if query.lower() in chunk.lower():
+                hits.append(
+                    f"[Kilde: {data['source']}]\n{chunk}"
+                )
+                if len(hits) >= max_hits:
+                    return hits
+
+    return hits
+
+
 # -------------------------------------------------
 # Health
 # -------------------------------------------------
@@ -152,6 +177,15 @@ async def ask(request: Request):
         raise HTTPException(status_code=400, detail="Question is required")
 
     context = ""
+
+# --- RAG: søk i Siemens datablad ---
+siemens_dir = os.path.join(DATABLAD_DIR, "Siemens")
+if os.path.exists(siemens_dir):
+    hits = search_datasheets(question, siemens_dir)
+
+    if hits:
+        context += "\n\n".join(hits)
+
 
     # --- Les vedlegg hvis finnes ---
     if file and file.filename:
