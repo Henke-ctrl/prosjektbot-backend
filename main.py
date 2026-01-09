@@ -8,6 +8,8 @@ from openpyxl import load_workbook
 import os
 import shutil
 import json
+import re
+from collections import defaultdict
 
 # -------------------------------------------------
 # Init
@@ -94,15 +96,27 @@ def index_all_datasheets(vendor: str):
             index_datasheet(os.path.join(vendor_dir, f), vendor)
 
 # -------------------------------------------------
-# Datablad – Steg 2 (Søk / RAG)
+# Datablad – Steg 2 (FORBEDRET SØK / RAG)
 # -------------------------------------------------
+
+def tokenize(text: str):
+    return re.findall(r"\w+", text.lower())
+
+def score_chunk(query_tokens, chunk_text):
+    score = 0
+    chunk_tokens = tokenize(chunk_text)
+    for t in query_tokens:
+        score += chunk_tokens.count(t)
+    return score
 
 def search_datasheets(query: str, vendor: str, max_hits: int = 4):
     vendor_dir = os.path.join(DATABLAD_DIR, vendor)
-    hits = []
-
     if not os.path.exists(vendor_dir):
-        return hits
+        return [], []
+
+    query_tokens = tokenize(query)
+    scored_chunks = []
+    sources = set()
 
     for f in os.listdir(vendor_dir):
         if not f.endswith(".json"):
@@ -113,14 +127,24 @@ def search_datasheets(query: str, vendor: str, max_hits: int = 4):
                 data = json.load(fh)
 
             for chunk in data.get("chunks", []):
-                if query.lower() in chunk.lower():
-                    hits.append(f"[{data['source']}]\n{chunk}")
-                    if len(hits) >= max_hits:
-                        return hits
+                score = score_chunk(query_tokens, chunk)
+                if score > 0:
+                    scored_chunks.append({
+                        "score": score,
+                        "text": chunk,
+                        "source": data["source"]
+                    })
         except Exception:
             continue
 
-    return hits
+    scored_chunks.sort(key=lambda x: x["score"], reverse=True)
+
+    hits = []
+    for item in scored_chunks[:max_hits]:
+        hits.append(f"[{item['source']}]\n{item['text']}")
+        sources.add(item["source"])
+
+    return hits, sorted(list(sources))
 
 # -------------------------------------------------
 # Health
@@ -143,7 +167,7 @@ def index_siemens():
         raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------------------------------
-# Chat /ask med RAG
+# Chat /ask med RAG + kilder
 # -------------------------------------------------
 
 @app.post("/ask")
@@ -171,10 +195,8 @@ async def ask(request: Request):
         raise HTTPException(status_code=400, detail="Question is required")
 
     # -------- RAG-søk --------
-    rag_context = ""
-    hits = search_datasheets(question, "Siemens")
-    if hits:
-        rag_context = "\n\n".join(hits[:4])[:3000]
+    rag_chunks, rag_sources = search_datasheets(question, "Siemens")
+    rag_context = "\n\n".join(rag_chunks)[:3000]
 
     # -------- Vedlegg --------
     attachment_text = ""
@@ -198,7 +220,7 @@ async def ask(request: Request):
             "content": (
                 "Du er en faglig KI-assistent for prosjektstøtte innen byggautomasjon.\n"
                 f"Brukerrolle: {role}\n"
-                "Svar presist og teknisk korrekt."
+                "Svar presist, teknisk korrekt og etterprøvbart."
             )
         }
     ]
@@ -227,6 +249,7 @@ async def ask(request: Request):
         return {
             "answer": resp.choices[0].message.content,
             "used_rag": bool(rag_context),
+            "sources": rag_sources,
             "used_attachment": bool(attachment_text)
         }
 
