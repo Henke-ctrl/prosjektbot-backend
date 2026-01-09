@@ -9,7 +9,7 @@ import os
 import shutil
 import json
 import re
-from collections import defaultdict
+import uuid
 
 # -------------------------------------------------
 # Init
@@ -37,6 +37,12 @@ DATABLAD_DIR = "datablad"
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(DATABLAD_DIR, exist_ok=True)
+
+# -------------------------------------------------
+# Enkel sesjonskontekst (per chat)
+# -------------------------------------------------
+
+SESSION_CONTEXT: dict[str, dict] = {}
 
 # -------------------------------------------------
 # Fil-lesing
@@ -68,7 +74,7 @@ def chunk_text(text: str, size: int = 500, overlap: int = 100):
     chunks = []
     i = 0
     while i < len(text):
-        chunks.append(text[i:i+size])
+        chunks.append(text[i:i + size])
         i += size - overlap
     return chunks
 
@@ -96,18 +102,15 @@ def index_all_datasheets(vendor: str):
             index_datasheet(os.path.join(vendor_dir, f), vendor)
 
 # -------------------------------------------------
-# Datablad – Steg 2 (FORBEDRET SØK / RAG)
+# Datablad – Steg 2 (Forbedret søk / RAG)
 # -------------------------------------------------
 
 def tokenize(text: str):
     return re.findall(r"\w+", text.lower())
 
 def score_chunk(query_tokens, chunk_text):
-    score = 0
     chunk_tokens = tokenize(chunk_text)
-    for t in query_tokens:
-        score += chunk_tokens.count(t)
-    return score
+    return sum(chunk_tokens.count(t) for t in query_tokens)
 
 def search_datasheets(query: str, vendor: str, max_hits: int = 4):
     vendor_dir = os.path.join(DATABLAD_DIR, vendor)
@@ -115,8 +118,7 @@ def search_datasheets(query: str, vendor: str, max_hits: int = 4):
         return [], []
 
     query_tokens = tokenize(query)
-    scored_chunks = []
-    sources = set()
+    scored = []
 
     for f in os.listdir(vendor_dir):
         if not f.endswith(".json"):
@@ -129,7 +131,7 @@ def search_datasheets(query: str, vendor: str, max_hits: int = 4):
             for chunk in data.get("chunks", []):
                 score = score_chunk(query_tokens, chunk)
                 if score > 0:
-                    scored_chunks.append({
+                    scored.append({
                         "score": score,
                         "text": chunk,
                         "source": data["source"]
@@ -137,14 +139,35 @@ def search_datasheets(query: str, vendor: str, max_hits: int = 4):
         except Exception:
             continue
 
-    scored_chunks.sort(key=lambda x: x["score"], reverse=True)
+    scored.sort(key=lambda x: x["score"], reverse=True)
 
     hits = []
-    for item in scored_chunks[:max_hits]:
+    sources = []
+    for item in scored[:max_hits]:
         hits.append(f"[{item['source']}]\n{item['text']}")
-        sources.add(item["source"])
+        if item["source"] not in sources:
+            sources.append(item["source"])
 
-    return hits, sorted(list(sources))
+    return hits, sources
+
+def load_chunks_from_sources(vendor: str, sources: list[str], max_chunks: int = 4):
+    vendor_dir = os.path.join(DATABLAD_DIR, vendor)
+    chunks = []
+
+    for f in os.listdir(vendor_dir):
+        if not f.endswith(".json"):
+            continue
+
+        with open(os.path.join(vendor_dir, f), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        if data["source"] in sources:
+            for chunk in data["chunks"]:
+                chunks.append(f"[{data['source']}]\n{chunk}")
+                if len(chunks) >= max_chunks:
+                    return chunks
+
+    return chunks
 
 # -------------------------------------------------
 # Health
@@ -167,7 +190,7 @@ def index_siemens():
         raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------------------------------
-# Chat /ask med RAG + kilder
+# Chat /ask med RAG + sesjonskontekst
 # -------------------------------------------------
 
 @app.post("/ask")
@@ -177,6 +200,12 @@ async def ask(request: Request):
     role = "Ukjent"
     file = None
 
+    # ---------- Sesjon ----------
+    session_id = request.headers.get("X-Session-ID")
+    if not session_id:
+        session_id = str(uuid.uuid4())
+
+    # ---------- Input ----------
     if "application/json" in content_type:
         body = await request.json()
         question = body.get("question")
@@ -194,11 +223,24 @@ async def ask(request: Request):
     if not question:
         raise HTTPException(status_code=400, detail="Question is required")
 
-    # -------- RAG-søk --------
+    # ---------- RAG ----------
     rag_chunks, rag_sources = search_datasheets(question, "Siemens")
+
+    # Hvis generisk oppfølgingsspørsmål → bruk aktiv kontekst
+    if not rag_chunks and len(question.split()) < 6:
+        ctx = SESSION_CONTEXT.get(session_id)
+        if ctx and ctx.get("active_sources"):
+            rag_sources = ctx["active_sources"]
+            rag_chunks = load_chunks_from_sources("Siemens", rag_sources)
+
+    if rag_sources:
+        SESSION_CONTEXT[session_id] = {
+            "active_sources": rag_sources
+        }
+
     rag_context = "\n\n".join(rag_chunks)[:3000]
 
-    # -------- Vedlegg --------
+    # ---------- Vedlegg ----------
     attachment_text = ""
     if file and file.filename:
         path = os.path.join(UPLOAD_DIR, file.filename)
@@ -213,14 +255,14 @@ async def ask(request: Request):
         elif ext in ["xlsx", "xls"]:
             attachment_text = read_excel(path)
 
-    # -------- Prompt --------
+    # ---------- Prompt ----------
     messages = [
         {
             "role": "system",
             "content": (
                 "Du er en faglig KI-assistent for prosjektstøtte innen byggautomasjon.\n"
                 f"Brukerrolle: {role}\n"
-                "Svar presist, teknisk korrekt og etterprøvbart."
+                "Svar presist, teknisk korrekt og basert på tilgjengelig dokumentasjon."
             )
         }
     ]
@@ -239,6 +281,7 @@ async def ask(request: Request):
 
     messages.append({"role": "user", "content": question})
 
+    # ---------- OpenAI ----------
     try:
         resp = client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -248,9 +291,9 @@ async def ask(request: Request):
 
         return {
             "answer": resp.choices[0].message.content,
-            "used_rag": bool(rag_context),
             "sources": rag_sources,
-            "used_attachment": bool(attachment_text)
+            "used_rag": bool(rag_sources),
+            "session_id": session_id
         }
 
     except Exception as e:
