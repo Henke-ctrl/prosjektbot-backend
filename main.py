@@ -150,5 +150,21 @@ def index_all_datasheets(base_dir: str, vendor: str):
         print(f"Indekserer {pdf_path}...")
         index_datasheet(pdf_path, vendor)
 
-if __name__ == "__main__":
-    index_all_datasheets("datablad/Siemens", "Siemens")
+
+def search_datasheets(query: str, vendor_dir: str) -> list[str]:
+    results = []
+
+    for filename in os.listdir(vendor_dir):
+        if not filename.endswith(".json"):
+            continue
+
+        path = os.path.join(vendor_dir, filename)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        for chunk in data["chunks"]:
+            if query.lower() in chunk.lower():
+                results.append(f"{data['source']}: {chunk[:200]}...")
+                break
+
+    return results
