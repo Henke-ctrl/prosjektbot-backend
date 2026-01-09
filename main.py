@@ -137,3 +137,18 @@ async def ask(request: Request):
         "answer": response.choices[0].message.content,
         "used_attachment": bool(context)
     }
+
+def index_all_datasheets(base_dir: str, vendor: str):
+    """
+    Leser alle PDF-er i datablad/vendor og lager .json-indekser
+    """
+    for filename in os.listdir(base_dir):
+        if not filename.lower().endswith(".pdf"):
+            continue
+
+        pdf_path = os.path.join(base_dir, filename)
+        print(f"Indekserer {pdf_path}...")
+        index_datasheet(pdf_path, vendor)
+
+if __name__ == "__main__":
+    index_all_datasheets("datablad/Siemens", "Siemens")
