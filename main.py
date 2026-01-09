@@ -7,6 +7,11 @@ from docx import Document
 from openpyxl import load_workbook
 import os
 import shutil
+import json
+
+# -------------------------------------------------
+# Init
+# -------------------------------------------------
 
 load_dotenv()
 
@@ -22,7 +27,10 @@ app.add_middleware(
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 UPLOAD_DIR = "uploads"
+DATABLAD_DIR = "datablad"
+
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(DATABLAD_DIR, exist_ok=True)
 
 # -------------------------------------------------
 # Fil-lesing
@@ -44,11 +52,48 @@ def read_excel(path: str) -> str:
 
     rows = []
     for i, row in enumerate(sheet.iter_rows(values_only=True)):
-        if i > 50:  # begrens for ytelse
+        if i > 50:
             break
         rows.append(" | ".join(str(cell) if cell is not None else "" for cell in row))
 
     return "\n".join(rows).strip()
+
+# -------------------------------------------------
+# Datablad-indeksering (Steg 1 – RAG)
+# -------------------------------------------------
+
+def chunk_text(text: str, chunk_size: int = 500) -> list[str]:
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - 100  # overlapp
+    return chunks
+
+def index_datasheet(pdf_path: str, vendor: str):
+    text = read_pdf(pdf_path)
+    chunks = chunk_text(text)
+
+    index = {
+        "vendor": vendor,
+        "source": os.path.basename(pdf_path),
+        "chunks": chunks
+    }
+
+    index_path = pdf_path.replace(".pdf", ".json")
+    with open(index_path, "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+
+    return index_path
+
+def index_all_datasheets(base_dir: str, vendor: str):
+    for filename in os.listdir(base_dir):
+        if not filename.lower().endswith(".pdf"):
+            continue
+
+        pdf_path = os.path.join(base_dir, filename)
+        index_datasheet(pdf_path, vendor)
 
 # -------------------------------------------------
 # Health
@@ -57,6 +102,24 @@ def read_excel(path: str) -> str:
 @app.get("/")
 def root():
     return {"status": "API running"}
+
+# -------------------------------------------------
+# API – Indekser Siemens datablad
+# -------------------------------------------------
+
+@app.post("/index/siemens")
+def index_siemens():
+    base_dir = os.path.join(DATABLAD_DIR, "Siemens")
+
+    if not os.path.exists(base_dir):
+        raise HTTPException(status_code=404, detail="Siemens-mappe finnes ikke")
+
+    index_all_datasheets(base_dir, "Siemens")
+
+    return {
+        "status": "Indeksering fullført",
+        "vendor": "Siemens"
+    }
 
 # -------------------------------------------------
 # Chat med valgfritt vedlegg (PDF / DOCX / XLSX)
@@ -82,11 +145,15 @@ async def ask(request: Request):
         role = form.get("role", role)
         file = form.get("file")
 
+    else:
+        raise HTTPException(status_code=415, detail="Unsupported content type")
+
     if not question or not question.strip():
         raise HTTPException(status_code=400, detail="Question is required")
 
     context = ""
 
+    # --- Les vedlegg hvis finnes ---
     if file and file.filename:
         path = os.path.join(UPLOAD_DIR, file.filename)
         with open(path, "wb") as f:
@@ -103,7 +170,7 @@ async def ask(request: Request):
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type")
 
-    context = context[:3500]  # viktig grense
+    context = context[:3500]
 
     messages = [
         {
@@ -111,7 +178,7 @@ async def ask(request: Request):
             "content": (
                 "Du er en faglig KI-assistent for prosjektstøtte innen byggautomasjon.\n"
                 f"Brukerrolle: {role}\n"
-                "Svar presist og faglig korrekt."
+                "Svar presist, faglig korrekt og strukturert."
             )
         }
     ]
@@ -119,7 +186,7 @@ async def ask(request: Request):
     if context:
         messages.append({
             "role": "system",
-            "content": f"Dokument-/Excel-innhold:\n{context}"
+            "content": f"Vedlagt dokumentinnhold:\n{context}"
         })
 
     messages.append({
@@ -127,44 +194,18 @@ async def ask(request: Request):
         "content": question
     })
 
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=messages,
-        timeout=30
-    )
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=messages,
+            timeout=30
+        )
 
-    return {
-        "answer": response.choices[0].message.content,
-        "used_attachment": bool(context)
-    }
+        return {
+            "answer": response.choices[0].message.content,
+            "used_attachment": bool(context)
+        }
 
-def index_all_datasheets(base_dir: str, vendor: str):
-    """
-    Leser alle PDF-er i datablad/vendor og lager .json-indekser
-    """
-    for filename in os.listdir(base_dir):
-        if not filename.lower().endswith(".pdf"):
-            continue
-
-        pdf_path = os.path.join(base_dir, filename)
-        print(f"Indekserer {pdf_path}...")
-        index_datasheet(pdf_path, vendor)
-
-
-def search_datasheets(query: str, vendor_dir: str) -> list[str]:
-    results = []
-
-    for filename in os.listdir(vendor_dir):
-        if not filename.endswith(".json"):
-            continue
-
-        path = os.path.join(vendor_dir, filename)
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        for chunk in data["chunks"]:
-            if query.lower() in chunk.lower():
-                results.append(f"{data['source']}: {chunk[:200]}...")
-                break
-
-    return results
+    except Exception as e:
+        print("OpenAI-feil:", e)
+        raise HTTPException(status_code=500, detail="AI backend error")
