@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -10,6 +10,7 @@ import shutil
 import json
 import re
 import uuid
+from typing import List
 
 # -------------------------------------------------
 # Init
@@ -39,7 +40,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(DATABLAD_DIR, exist_ok=True)
 
 # -------------------------------------------------
-# Enkel sesjonskontekst (per chat)
+# Sesjonskontekst (per chat)
 # -------------------------------------------------
 
 SESSION_CONTEXT: dict[str, dict] = {}
@@ -67,7 +68,7 @@ def read_excel(path: str) -> str:
     return "\n".join(rows)
 
 # -------------------------------------------------
-# Datablad – Steg 1 (Indeksering)
+# Datablad – Indeksering
 # -------------------------------------------------
 
 def chunk_text(text: str, size: int = 500, overlap: int = 100):
@@ -88,8 +89,7 @@ def index_datasheet(pdf_path: str, vendor: str):
         "chunks": chunks
     }
 
-    index_path = pdf_path.replace(".pdf", ".json")
-    with open(index_path, "w", encoding="utf-8") as f:
+    with open(pdf_path.replace(".pdf", ".json"), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def index_all_datasheets(vendor: str):
@@ -102,15 +102,40 @@ def index_all_datasheets(vendor: str):
             index_datasheet(os.path.join(vendor_dir, f), vendor)
 
 # -------------------------------------------------
-# Datablad – Steg 2 (Forbedret søk / RAG)
+# Produktidentifikasjon
+# -------------------------------------------------
+
+PRODUCT_REGEX = re.compile(r"\b[A-Z]{2,4}\d{3,5}[-\.]?\d*\b")
+
+def extract_product_ids(text: str) -> List[str]:
+    return list(set(PRODUCT_REGEX.findall(text.upper())))
+
+def match_products_by_filename(products: List[str], vendor: str) -> List[str]:
+    vendor_dir = os.path.join(DATABLAD_DIR, vendor)
+    matches = []
+
+    for f in os.listdir(vendor_dir):
+        if not f.lower().endswith(".pdf"):
+            continue
+
+        fname = f.lower().replace(" ", "")
+        for p in products:
+            if p.lower().replace(".", "").replace("-", "") in fname:
+                matches.append(f)
+                break
+
+    return matches
+
+# -------------------------------------------------
+# RAG – forbedret søk
 # -------------------------------------------------
 
 def tokenize(text: str):
     return re.findall(r"\w+", text.lower())
 
 def score_chunk(query_tokens, chunk_text):
-    chunk_tokens = tokenize(chunk_text)
-    return sum(chunk_tokens.count(t) for t in query_tokens)
+    tokens = tokenize(chunk_text)
+    return sum(tokens.count(t) for t in query_tokens)
 
 def search_datasheets(query: str, vendor: str, max_hits: int = 4):
     vendor_dir = os.path.join(DATABLAD_DIR, vendor)
@@ -150,7 +175,7 @@ def search_datasheets(query: str, vendor: str, max_hits: int = 4):
 
     return hits, sources
 
-def load_chunks_from_sources(vendor: str, sources: list[str], max_chunks: int = 4):
+def load_chunks_from_sources(vendor: str, sources: List[str], max_chunks: int = 4):
     vendor_dir = os.path.join(DATABLAD_DIR, vendor)
     chunks = []
 
@@ -178,69 +203,68 @@ def root():
     return {"status": "API running"}
 
 # -------------------------------------------------
-# API – Indekser Siemens datablad
+# Indekser Siemens
 # -------------------------------------------------
 
 @app.post("/index/siemens")
 def index_siemens():
-    try:
-        index_all_datasheets("Siemens")
-        return {"status": "Indeksering fullført", "vendor": "Siemens"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    index_all_datasheets("Siemens")
+    return {"status": "Indeksering fullført", "vendor": "Siemens"}
 
 # -------------------------------------------------
-# Chat /ask med RAG + sesjonskontekst
+# Chat /ask
 # -------------------------------------------------
 
 @app.post("/ask")
 async def ask(request: Request):
+    session_id = request.headers.get("X-Session-ID") or str(uuid.uuid4())
+    SESSION_CONTEXT.setdefault(session_id, {"sources": []})
+
     content_type = request.headers.get("content-type", "")
     question = None
     role = "Ukjent"
     file = None
 
-    # ---------- Sesjon ----------
-    session_id = request.headers.get("X-Session-ID")
-    if not session_id:
-        session_id = str(uuid.uuid4())
-
-    # ---------- Input ----------
     if "application/json" in content_type:
         body = await request.json()
         question = body.get("question")
         role = body.get("role", role)
-
     elif "multipart/form-data" in content_type:
         form = await request.form()
         question = form.get("question")
         role = form.get("role", role)
         file = form.get("file")
-
     else:
         raise HTTPException(status_code=415, detail="Unsupported content type")
 
     if not question:
         raise HTTPException(status_code=400, detail="Question is required")
 
-    # ---------- RAG ----------
+    # -------- 1. Finn produkt-ID-er --------
+    products = extract_product_ids(question)
+
+    # -------- 2. RAG-søk --------
     rag_chunks, rag_sources = search_datasheets(question, "Siemens")
 
-    # Hvis generisk oppfølgingsspørsmål → bruk aktiv kontekst
-    if not rag_chunks and len(question.split()) < 6:
-        ctx = SESSION_CONTEXT.get(session_id)
-        if ctx and ctx.get("active_sources"):
-            rag_sources = ctx["active_sources"]
-            rag_chunks = load_chunks_from_sources("Siemens", rag_sources)
+    # -------- 3. Filnavn-fallback --------
+    if products:
+        filename_hits = match_products_by_filename(products, "Siemens")
+        for f in filename_hits:
+            if f not in rag_sources:
+                rag_sources.append(f)
 
+    # -------- 4. Gjenbruk sesjonskontekst --------
+    if not rag_sources and len(question.split()) < 6:
+        rag_sources = SESSION_CONTEXT[session_id].get("sources", [])
+
+    # -------- 5. Last chunks --------
     if rag_sources:
-        SESSION_CONTEXT[session_id] = {
-            "active_sources": rag_sources
-        }
+        rag_chunks = load_chunks_from_sources("Siemens", rag_sources)
+        SESSION_CONTEXT[session_id]["sources"] = rag_sources
 
     rag_context = "\n\n".join(rag_chunks)[:3000]
 
-    # ---------- Vedlegg ----------
+    # -------- 6. Vedlegg --------
     attachment_text = ""
     if file and file.filename:
         path = os.path.join(UPLOAD_DIR, file.filename)
@@ -255,14 +279,14 @@ async def ask(request: Request):
         elif ext in ["xlsx", "xls"]:
             attachment_text = read_excel(path)
 
-    # ---------- Prompt ----------
+    # -------- 7. Prompt --------
     messages = [
         {
             "role": "system",
             "content": (
                 "Du er en faglig KI-assistent for prosjektstøtte innen byggautomasjon.\n"
                 f"Brukerrolle: {role}\n"
-                "Svar presist, teknisk korrekt og basert på tilgjengelig dokumentasjon."
+                "Svar presist, teknisk korrekt og basert på dokumentasjon."
             )
         }
     ]
@@ -281,20 +305,16 @@ async def ask(request: Request):
 
     messages.append({"role": "user", "content": question})
 
-    # ---------- OpenAI ----------
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=messages,
-            timeout=30
-        )
+    # -------- 8. OpenAI --------
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=messages,
+        timeout=30
+    )
 
-        return {
-            "answer": resp.choices[0].message.content,
-            "sources": rag_sources,
-            "used_rag": bool(rag_sources),
-            "session_id": session_id
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI-feil: {e}")
+    return {
+        "answer": resp.choices[0].message.content,
+        "sources": rag_sources,
+        "session_id": session_id,
+        "used_rag": bool(rag_sources)
+    }
