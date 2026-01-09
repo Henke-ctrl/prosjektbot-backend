@@ -15,6 +15,12 @@ import json
 
 load_dotenv()
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY mangler")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
 app = FastAPI()
 
 app.add_middleware(
@@ -23,8 +29,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 UPLOAD_DIR = "uploads"
 DATABLAD_DIR = "datablad"
@@ -38,44 +42,39 @@ os.makedirs(DATABLAD_DIR, exist_ok=True)
 
 def read_pdf(path: str) -> str:
     reader = PdfReader(path)
-    return "\n".join(
-        page.extract_text() or "" for page in reader.pages
-    ).strip()
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
 
 def read_docx(path: str) -> str:
     doc = Document(path)
-    return "\n".join(p.text for p in doc.paragraphs).strip()
+    return "\n".join(p.text for p in doc.paragraphs)
 
 def read_excel(path: str) -> str:
     wb = load_workbook(path, data_only=True)
     sheet = wb.active
-
     rows = []
     for i, row in enumerate(sheet.iter_rows(values_only=True)):
         if i > 50:
             break
-        rows.append(" | ".join(str(cell) if cell is not None else "" for cell in row))
-
-    return "\n".join(rows).strip()
+        rows.append(" | ".join(str(c) if c else "" for c in row))
+    return "\n".join(rows)
 
 # -------------------------------------------------
-# Datablad-indeksering (Steg 1 – RAG)
+# Datablad – Steg 1 (Indeksering)
 # -------------------------------------------------
 
-def chunk_text(text: str, chunk_size: int = 500) -> list[str]:
+def chunk_text(text: str, size: int = 500, overlap: int = 100):
     chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - 100  # overlapp
+    i = 0
+    while i < len(text):
+        chunks.append(text[i:i+size])
+        i += size - overlap
     return chunks
 
 def index_datasheet(pdf_path: str, vendor: str):
     text = read_pdf(pdf_path)
     chunks = chunk_text(text)
 
-    index = {
+    data = {
         "vendor": vendor,
         "source": os.path.basename(pdf_path),
         "chunks": chunks
@@ -83,42 +82,45 @@ def index_datasheet(pdf_path: str, vendor: str):
 
     index_path = pdf_path.replace(".pdf", ".json")
     with open(index_path, "w", encoding="utf-8") as f:
-        json.dump(index, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-    return index_path
+def index_all_datasheets(vendor: str):
+    vendor_dir = os.path.join(DATABLAD_DIR, vendor)
+    if not os.path.exists(vendor_dir):
+        raise FileNotFoundError(f"Mangler mappe {vendor_dir}")
 
-def index_all_datasheets(base_dir: str, vendor: str):
-    for filename in os.listdir(base_dir):
-        if not filename.lower().endswith(".pdf"):
-            continue
+    for f in os.listdir(vendor_dir):
+        if f.lower().endswith(".pdf"):
+            index_datasheet(os.path.join(vendor_dir, f), vendor)
 
-        pdf_path = os.path.join(base_dir, filename)
-        index_datasheet(pdf_path, vendor)
+# -------------------------------------------------
+# Datablad – Steg 2 (Søk / RAG)
+# -------------------------------------------------
 
-def search_datasheets(query: str, vendor_dir: str, max_hits: int = 5) -> list[str]:
-    """
-    Enkel RAG-søk: finner relevante tekstbiter i indekserte datablad
-    """
+def search_datasheets(query: str, vendor: str, max_hits: int = 4):
+    vendor_dir = os.path.join(DATABLAD_DIR, vendor)
     hits = []
 
-    for filename in os.listdir(vendor_dir):
-        if not filename.endswith(".json"):
+    if not os.path.exists(vendor_dir):
+        return hits
+
+    for f in os.listdir(vendor_dir):
+        if not f.endswith(".json"):
             continue
 
-        path = os.path.join(vendor_dir, filename)
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            with open(os.path.join(vendor_dir, f), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
 
-        for chunk in data["chunks"]:
-            if query.lower() in chunk.lower():
-                hits.append(
-                    f"[Kilde: {data['source']}]\n{chunk}"
-                )
-                if len(hits) >= max_hits:
-                    return hits
+            for chunk in data.get("chunks", []):
+                if query.lower() in chunk.lower():
+                    hits.append(f"[{data['source']}]\n{chunk}")
+                    if len(hits) >= max_hits:
+                        return hits
+        except Exception:
+            continue
 
     return hits
-
 
 # -------------------------------------------------
 # Health
@@ -134,20 +136,14 @@ def root():
 
 @app.post("/index/siemens")
 def index_siemens():
-    base_dir = os.path.join(DATABLAD_DIR, "Siemens")
-
-    if not os.path.exists(base_dir):
-        raise HTTPException(status_code=404, detail="Siemens-mappe finnes ikke")
-
-    index_all_datasheets(base_dir, "Siemens")
-
-    return {
-        "status": "Indeksering fullført",
-        "vendor": "Siemens"
-    }
+    try:
+        index_all_datasheets("Siemens")
+        return {"status": "Indeksering fullført", "vendor": "Siemens"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------------------------------
-# Chat med valgfritt vedlegg (PDF / DOCX / XLSX)
+# Chat /ask med RAG
 # -------------------------------------------------
 
 @app.post("/ask")
@@ -157,13 +153,11 @@ async def ask(request: Request):
     role = "Ukjent"
     file = None
 
-    # JSON
     if "application/json" in content_type:
-        data = await request.json()
-        question = data.get("question")
-        role = data.get("role", role)
+        body = await request.json()
+        question = body.get("question")
+        role = body.get("role", role)
 
-    # FormData (med fil)
     elif "multipart/form-data" in content_type:
         form = await request.form()
         question = form.get("question")
@@ -173,73 +167,68 @@ async def ask(request: Request):
     else:
         raise HTTPException(status_code=415, detail="Unsupported content type")
 
-    if not question or not question.strip():
+    if not question:
         raise HTTPException(status_code=400, detail="Question is required")
 
-    context = ""
-
-# --- RAG: søk i Siemens datablad ---
-siemens_dir = os.path.join(DATABLAD_DIR, "Siemens")
-if os.path.exists(siemens_dir):
-    hits = search_datasheets(question, siemens_dir)
-
+    # -------- RAG-søk --------
+    rag_context = ""
+    hits = search_datasheets(question, "Siemens")
     if hits:
-        context += "\n\n".join(hits)
+        rag_context = "\n\n".join(hits[:4])[:3000]
 
-
-    # --- Les vedlegg hvis finnes ---
+    # -------- Vedlegg --------
+    attachment_text = ""
     if file and file.filename:
         path = os.path.join(UPLOAD_DIR, file.filename)
         with open(path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
         ext = file.filename.lower().split(".")[-1]
-
         if ext == "pdf":
-            context = read_pdf(path)
+            attachment_text = read_pdf(path)
         elif ext in ["docx", "doc"]:
-            context = read_docx(path)
+            attachment_text = read_docx(path)
         elif ext in ["xlsx", "xls"]:
-            context = read_excel(path)
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file type")
+            attachment_text = read_excel(path)
 
-    context = context[:3500]
-
+    # -------- Prompt --------
     messages = [
         {
             "role": "system",
             "content": (
                 "Du er en faglig KI-assistent for prosjektstøtte innen byggautomasjon.\n"
                 f"Brukerrolle: {role}\n"
-                "Svar presist, faglig korrekt og strukturert."
+                "Svar presist og teknisk korrekt."
             )
         }
     ]
 
-    if context:
+    if rag_context:
         messages.append({
             "role": "system",
-            "content": f"Vedlagt dokumentinnhold:\n{context}"
+            "content": f"Relevante utdrag fra datablad:\n{rag_context}"
         })
 
-    messages.append({
-        "role": "user",
-        "content": question
-    })
+    if attachment_text:
+        messages.append({
+            "role": "system",
+            "content": f"Innhold fra vedlegg:\n{attachment_text[:2000]}"
+        })
+
+    messages.append({"role": "user", "content": question})
 
     try:
-        response = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=messages,
             timeout=30
         )
 
         return {
-            "answer": response.choices[0].message.content,
-            "used_attachment": bool(context)
+            "answer": resp.choices[0].message.content,
+            "used_rag": bool(rag_context),
+            "used_attachment": bool(attachment_text)
         }
 
     except Exception as e:
-        print("OpenAI-feil:", e)
-        raise HTTPException(status_code=500, detail="AI backend error")
+        raise HTTPException(status_code=500, detail=f"AI-feil: {e}")
